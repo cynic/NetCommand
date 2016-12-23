@@ -69,23 +69,23 @@ case class NegativeZ() extends Direction
 abstract class UserCommand
 case class PlayerPos() extends UserCommand // "pos"
 case class PlayerLook() extends UserCommand // "look"
-case class SetOrigin(dist:Int) extends UserCommand // "origin [n]" (n must be positive)
-case class ChangeX (n:Int) extends UserCommand // "x [n]" (n must be explicitly positive/negative) 
-case class ChangeY (n:Int) extends UserCommand // "y [n]" (see above)
-case class ChangeZ (n:Int) extends UserCommand // "z [n]" (see above)
-case class GetBlock () extends UserCommand // "getblock"
-case class SetBlock (v:Int, facing:Direction) extends UserCommand // "set [id] [+y|-y|+x|-x|+z|-z]"
+case class GetOrigin(dist:Int) extends UserCommand // "origin [n]" (n must be positive)
+case class GetBlock (x:Int, y:Int, z:Int) extends UserCommand // "getblock [x] [y] [z]"
+case class SetBlock (v:Int, x:Int, y:Int, z:Int, facing:Direction) extends UserCommand // "set [id] [x] [y] [z] [+y|-y|+x|-x|+z|-z]"
 case class BlockIDs () extends UserCommand // "idlist"
 
 abstract class WorldCommand
 case class UpdateRequest(x:UserCommand) extends WorldCommand
 case class WorldTick(w: EntityPlayer) extends WorldCommand
 
-class WorldUpdater extends Actor {
-  val logger = FMLLog.getLogger()
+object CommandQueuer {
   import scala.collection.mutable
   val queue = new java.util.concurrent.ConcurrentLinkedQueue[(ActorRef,UserCommand)]
-  var origin = new net.minecraft.util.math.Vec3d(0,0,0)
+}
+
+class WorldUpdater extends Actor {
+  val logger = FMLLog.getLogger()
+  val queue = CommandQueuer.queue
 
   def receive = {
     case UpdateRequest(cmd) =>
@@ -102,32 +102,21 @@ class WorldUpdater extends Actor {
   def dispatch (player: EntityPlayer) = (s:ActorRef, x:UserCommand) =>
     x match {
       case PlayerPos () =>
-        val result = (player.posX, player.posY, player.posZ)
-        logger.info(result)
-        s ! ByteString(result.toString())
+        s ! ByteString ( (player.posX, player.posY, player.posZ).toString() + "\n" )
       case PlayerLook () =>
         val v3d = player.getLookVec()
-        s ! ByteString ( (v3d.xCoord, v3d.yCoord, v3d.zCoord).toString() )
-      case SetOrigin (dist) =>
+        s ! ByteString ( (v3d.xCoord, v3d.yCoord, v3d.zCoord).toString() + "\n" )
+      case GetOrigin (dist) =>
         val v3d = player.getLookVec()
-        this.origin = new Vec3d (player.posX + v3d.xCoord * dist, player.posY + v3d.yCoord * dist + player.getEyeHeight(), player.posZ + v3d.zCoord * dist)
-        s ! ByteString("OK")
-      case ChangeX (n) =>
-        this.origin = this.origin.addVector(n, 0, 0)
-        s ! ByteString("OK")
-      case ChangeY (n) =>
-        this.origin = this.origin.addVector(0, n, 0)
-        s ! ByteString("OK")
-      case ChangeZ (n) =>
-        this.origin = this.origin.addVector(0, 0, n)
-        s ! ByteString("OK")
-      case GetBlock () =>
-        val pos = new BlockPos(origin.xCoord, origin.yCoord, origin.zCoord)
+        val res = new Vec3d (player.posX + v3d.xCoord * dist, player.posY + v3d.yCoord * dist + player.getEyeHeight(), player.posZ + v3d.zCoord * dist)
+        s ! ByteString( (res.xCoord, res.yCoord, res.zCoord).toString() + "\n" )
+      case GetBlock (x, y, z) =>
+        val pos = new BlockPos(x, y, z)
         val blockState = player.world.getBlockState(pos)
         val block = blockState.getBlock()
-        s ! ByteString(net.minecraft.block.Block.getIdFromBlock(block))
-      case SetBlock (v, facing) =>
-        val pos = new BlockPos(origin.xCoord, origin.yCoord, origin.zCoord)
+        s ! ByteString( net.minecraft.block.Block.getIdFromBlock(block).toString() + "\n" )
+      case SetBlock (v, x, y, z, facing) =>
+        val pos = new BlockPos(x, y, z)
         player.world.destroyBlock(pos, false)
         val block = Block.getBlockById(v)
         val blockState = block.getDefaultState()
@@ -145,7 +134,7 @@ class WorldUpdater extends Actor {
                 case NegativeZ () => EnumFacing.NORTH
               }
             player.world.setBlockState(pos, blockState.withProperty(propKey.asInstanceOf[PropertyDirection], dir))
-            s ! ByteString("OK")
+            //s ! ByteString("OK")
         }
       case BlockIDs () =>
         val name = Block.REGISTRY.getKeys().toList.foreach { f =>
@@ -157,6 +146,7 @@ class WorldUpdater extends Actor {
           s ! ByteString( (dom, path, id).toString() )
           // NOTE: Variants are a huge mess.  So I'm basically ignoring them at this point!
         }
+        s ! ByteString("\n")
     }
 }
 
@@ -186,46 +176,30 @@ class ConnectionHandler(conn : ActorRef) extends Actor {
   val updater = context.actorSelection("../../updater")
   val server = context.actorSelection("../server")
   val origin = """^origin (\d{1,6})""".r
-  val chpx = """x \+(\d{1,6})""".r
-  val chnx = """x -(\d{1,6})""".r
-  val chpy = """y \+(\d{1,6})""".r
-  val chny = """y -(\d{1,6})""".r
-  val chpz = """z \+(\d{1,6})""".r
-  val chnz = """z -(\d{1,6})""".r
-  val setb = """set (\d{1,5}) ([+-])([xyz])""".r
+  val getb = """getblock (-?\d{1,5}) (-?\d{1,5}) (-?\d{1,5})""".r
+  val setb = """set (\d{1,5}) (-?\d{1,5}) (-?\d{1,5}) (-?\d{1,5}) ([+-])([xyz])""".r
   import Tcp._
   def parse (s:String) : Option[UserCommand] =
-/*
-case class SetOrigin(dist:Int) extends UserCommand // "origin [n]" (n must be positive)
-case class ChangeX (n:Int) extends UserCommand // "x [n]" (n must be explicitly positive/negative) 
-case class ChangeY (n:Int) extends UserCommand // "y [n]" (see above)
-case class ChangeZ (n:Int) extends UserCommand // "z [n]" (see above)
-case class SetBlock (v:Int, facing:Direction) extends UserCommand // "set [id] [+y|-y|+x|-x|+z|-z]"
- */
     if (s == "pos") { return Some (PlayerPos ()) }
     else if (s == "look") { return Some (PlayerLook ()) }
-    else if (s == "getblock") { return Some (GetBlock ()) }
     else if (s == "idlist") { return Some (BlockIDs ()) }
     else {
       s match {
-        case origin(dist) => return Some (SetOrigin (dist.toInt))
-        case chpx(n) => return Some (ChangeX (n.toInt))
-        case chnx(n) => return Some (ChangeX (-(n.toInt)))
-        case chpy(n) => return Some (ChangeY (n.toInt))
-        case chny(n) => return Some (ChangeY (-(n.toInt)))
-        case chpz(n) => return Some (ChangeZ (n.toInt))
-        case chnz(n) => return Some (ChangeZ (-(n.toInt)))
-        case setb(id, sign, axis) =>
-          val v = id.toInt
+        case origin(dist) => return Some (GetOrigin (dist.toInt))
+        case setb(id, _x, _y, _z, sign, axis) =>
+          val (v, x, y, z) = (id.toInt, _x.toInt, _y.toInt, _z.toInt)
           (sign, axis) match {
-            case ("+","x") => return Some (SetBlock(v, PositiveX ())) 
-            case ("-", "x") => return Some (SetBlock(v, NegativeX ()))
-            case ("+","y") => return Some (SetBlock(v, Up ())) 
-            case ("-", "y") => return Some (SetBlock(v, Down ()))
-            case ("+","z") => return Some (SetBlock(v, PositiveZ ())) 
-            case ("-", "z") => return Some (SetBlock(v, NegativeZ ()))            
+            case ("+","x") => return Some (SetBlock(v, x, y, z, PositiveX ())) 
+            case ("-", "x") => return Some (SetBlock(v, x, y, z, NegativeX ()))
+            case ("+","y") => return Some (SetBlock(v, x, y, z, Up ())) 
+            case ("-", "y") => return Some (SetBlock(v, x, y, z, Down ()))
+            case ("+","z") => return Some (SetBlock(v, x, y, z, PositiveZ ())) 
+            case ("-", "z") => return Some (SetBlock(v, x, y, z, NegativeZ ()))            
             case _ => return None
           }
+        case getb(_x, _y, _z) =>
+          val (x, y, z) = (_x.toInt, _y.toInt, _z.toInt)
+          return Some (GetBlock(x, y, z))
         case _ => return None
       }
     }
@@ -265,35 +239,26 @@ class TickHandler(updater : ActorRef) {
   }
 }
 
-@Mod(modid = "netcommand .cynic", name = "NetCommand", modLanguage = "scala", version = "0.0.1")
+@Mod(modid = "netcommand.cynic", name = "NetCommand", modLanguage = "scala", version = "0.0.1")
 object NetCommand {
   val logger = FMLLog.getLogger()
-  import com.typesafe.config.ConfigFactory
-  val customConf = ConfigFactory.parseString("""
-akka {
-  actor {
-    serializers {
-      proto = "akka.remote.serialization.ProtobufSerializer"
-    }
-  }
-}""")
   val actorSys = ActorSystem.create("netcommand")
-  val updater = actorSys.actorOf(Props[WorldUpdater], "updater")
-  val server = actorSys.actorOf(Props[Server], "server")
 
   @EventHandler
   def preInit(e: FMLPreInitializationEvent) {
-    logger.info("*************************** PRE-INIT!")
+    logger.info("pre-init: creating actor system, adding TickHandler")
+    val updater = actorSys.actorOf(Props[WorldUpdater], "updater")
     MinecraftForge.EVENT_BUS.register(new TickHandler(updater))
   }
 
   @EventHandler
   def init(e: FMLInitializationEvent) {
-    logger.info("*************************** INIT!")
-  }
+    logger.info("init: starting server")
+    val server = actorSys.actorOf(Props[Server], "server")
+  }  
 
   @EventHandler
   def postInit(e: FMLPostInitializationEvent) {
-    logger.info("*************************** POST-INIT!")
+    logger.info("post-init.")
   }  
 }
